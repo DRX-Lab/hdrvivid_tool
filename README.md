@@ -1,64 +1,111 @@
-# HDRVivid-Tool
+# **hdrvivid_tool**
 
-A utility for extracting and injecting HDR Vivid SEI metadata from HEVC (.hevc/.h265) video files.
+`hdrvivid_tool` is a command-line tool for working with **HDR Vivid** metadata in **HEVC Annex-B** bitstreams.
+
+It allows you to:
+
+* Inspect HEVC files for HDR Vivid metadata
+* Extract HDR Vivid metadata to a single BIN file
+* Remove HDR Vivid metadata from a video
+* Inject HDR Vivid metadata from a BIN into a video
+* Plot HDR Vivid metadata from a BIN into a PNG image
 
 ---
 
-## Features
+## **Requirements**
 
-- **Extraction**: Extract full HDR Vivid SEI metadata from an HEVC file into a binary `.bin` file.
-- **Injection**: Inject HDR Vivid SEI metadata from a `.bin` file back into an HEVC video stream.
+* Python **3.9+**
+* For `plot` only:
+
+  ```console
+  pip install matplotlib
+  ```
 
 ---
 
-## Usage
+## **Basic Usage**
 
-Extract HDR Vivid SEI metadata to a `.bin` file:
+```console
+hdrvivid_tool <command> [options]
+```
 
-```bash
-python hdrvivid_tool.py -i input.hevc --extract-bin
-````
+To see help for a command:
 
-Inject HDR Vivid SEI metadata from a `.bin` file into an HEVC file:
-
-```bash
-python hdrvivid_tool.py -i input.hevc --inject-bin hdr_vivid_full.bin -o output.hevc
+```console
+hdrvivid_tool <command> --help
 ```
 
 ---
 
-## Command Line Arguments
+## **Commands**
 
-| Option                | Description                                      | Required                                |
-| --------------------- | ------------------------------------------------ | --------------------------------------- |
-| `-i`, `--input`       | Input HEVC file (.hevc or .h265)                 | Yes                                     |
-| `-e`, `--extract-bin` | Extract HDR Vivid SEI metadata to a `.bin` file  | No (mutually exclusive with injection)  |
-| `-j`, `--inject-bin`  | Inject HDR Vivid SEI metadata from a `.bin` file | No (mutually exclusive with extraction) |
-| `-o`, `--output`      | Output file path when injecting SEI metadata     | Required when injecting                 |
+### **info**
 
----
+Validate and analyze an HEVC stream.
+(Progress bar only.)
 
-## Important Note About Test Files
-
-## Notes
-
-This project is a conceptual and experimental implementation inspired by [dovi_tool](https://github.com/quietvoid/dovi_tool), adapted specifically for HDR Vivid, the Chinese HDR format.
-
-Please be advised that this tool may not function correctly in all scenarios and is subject to errors and inaccuracies.
-
-The files `test_hdrvivid.hevc` and `test_hdr.hevc` represent the same base video content with one key difference:
-
-- `test_hdrvivid.hevc` is the original video file **containing HDR Vivid SEI metadata**.
-- `test_hdr.hevc` is a version where the HDR Vivid SEI metadata has been **removed for testing purposes**.
-
-This setup is intended solely for testing and demonstration purposes, allowing users to **extract** the HDR Vivid metadata from `test_hdrvivid.hevc` and **inject** it into `test_hdr.hevc`, thereby illustrating how the extraction and injection functionalities of this tool are expected to operate.
-
-Any contributions, suggestions, or assistance to improve or complete the tool are highly appreciated.
+```console
+python hdrvivid_tool.py info -i input.hevc
+```
 
 ---
 
-## Requirements
+### **extract**
 
-* Python 3.x
+Extract HDR Vivid metadata from an HEVC file into a **single BIN**.
+
+```console
+python hdrvivid_tool.py extract -i input.hevc -o metadata.bin
+```
+
+---
+
+### **remove**
+
+Remove HDR Vivid metadata from an HEVC file.
+
+```console
+python hdrvivid_tool.py remove -i input.hevc -o output_no_vivid.hevc
+```
+
+---
+
+### **inject**
+
+Inject or replace HDR Vivid metadata from a BIN into an HEVC file.
+
+Behavior:
+
+* Verifies frame order using AUD NAL units
+* If BIN length ≠ video frame count:
+
+  * Short BIN → metadata is duplicated to match
+  * Long BIN → metadata is truncated
+
+Output:
+
+* Informational prints (dovi_tool-style)
+* **Exactly two progress bars**
+
+```console
+python hdrvivid_tool.py inject -i input.hevc --bin metadata.bin -o output_injected.hevc
+```
+
+---
+
+### **plot**
+
+Generate a PNG plot from a BIN file (**no HEVC input required**).
+* Title: **HDR Vivid Plot**
+* Uses BIN filename in the overlay
+
+```console
+python hdrvivid_tool.py plot -i metadata.bin -o plot.png
+```
+
+---
+
+## **Notes**
+* Plot values are **estimated** until full HDR Vivid payload decoding is implemented.
 
 ---
