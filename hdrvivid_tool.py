@@ -279,6 +279,49 @@ def is_hdrvivid_t35(payload: bytes) -> bool:
 
 
 # ----------------------------
+# Minimal bitreader (for slice header inspection)
+# ----------------------------
+class _BitReader:
+    __slots__ = ("_b", "_i", "_n")
+    def __init__(self, data: bytes):
+        self._b = data
+        self._i = 0  # bit index
+        self._n = len(data) * 8
+
+    def read_bits(self, k: int) -> int:
+        if k <= 0:
+            return 0
+        if self._i + k > self._n:
+            raise EOFError("bitreader overflow")
+        v = 0
+        for _ in range(k):
+            byte = self._b[self._i >> 3]
+            shift = 7 - (self._i & 7)
+            v = (v << 1) | ((byte >> shift) & 1)
+            self._i += 1
+        return v
+
+def _hevc_first_slice_segment_in_pic_flag(nal: bytes) -> Optional[bool]:
+    """Best-effort: returns True/False for VCL NALs, otherwise None.
+
+    For HEVC slice_segment_layer_rbsp, the first bit is first_slice_segment_in_pic_flag.
+    We only need this 1-bit flag to approximate Access Unit boundaries when AUD is absent.
+    """
+    if len(nal) < 3:
+        return None
+    t = nal_type_hevc(nal)
+    if not (0 <= t <= 31):
+        return None
+    rbsp = remove_emulation_prevention(nal[2:])
+    if not rbsp:
+        return None
+    try:
+        br = _BitReader(rbsp)
+        return bool(br.read_bits(1))
+    except Exception:
+        return None
+
+# ----------------------------
 # NAL model and AU mapping
 # ----------------------------
 @dataclass
@@ -301,14 +344,42 @@ def parse_nals_fast(data: bytes) -> List[NalUnit]:
     return nals
 
 def compute_au_map(nals: List[NalUnit]) -> List[int]:
-    if not any(n.nal_type == 35 for n in nals):
-        return [-1] * len(nals)
+    """Map each NAL to an Access Unit index.
+
+    Primary method: use AUD (nal_type 35).
+    Fallback (when AUD is absent): start a new AU on each VCL NAL whose
+    first_slice_segment_in_pic_flag == 1 (or on the first VCL seen).
+    """
+    # Primary: AUD (NAL 35)
+    if any(n.nal_type == 35 for n in nals):
+        au = -1
+        out: List[int] = []
+        for n in nals:
+            if n.nal_type == 35:
+                au += 1
+            out.append(au)
+        return out
+
+    # Fallback: derive AU boundaries from slice headers (best-effort)
     au = -1
-    out = []
+    out: List[int] = []
+    saw_vcl = False
+
     for n in nals:
-        if n.nal_type == 35:
-            au += 1
-        out.append(au)
+        t = n.nal_type
+        if 0 <= t <= 31:  # VCL
+            saw_vcl = True
+            fs = _hevc_first_slice_segment_in_pic_flag(n.nal)
+            if au == -1 or fs is True:
+                au += 1
+            out.append(au)
+        else:
+            # Parameter sets / SEI, etc. belong to the current AU; if we haven't
+            # reached the first VCL yet, treat them as AU 0 for practical use.
+            out.append(au if au >= 0 else 0)
+
+    if not saw_vcl:
+        return [-1] * len(nals)
     return out
 
 def first_vcl_in_au(nals: List[NalUnit], au_map: List[int], au: int) -> Optional[int]:
@@ -364,7 +435,7 @@ def normalize_bin_to_au_count_cycle(bin_entries: List[Optional[bytes]], au_count
     if au_count <= 0:
         return []
     if not bin_entries:
-        raise SystemExit("ERROR: BIN vacío o inválido.")
+        raise SystemExit("ERROR: Empty or invalid BIN file.")
     if len(bin_entries) >= au_count:
         return bin_entries[:au_count]
     out = list(bin_entries)
@@ -384,11 +455,11 @@ def plot_hdrvivid_style_png(path_png: str, entries: List[Optional[bytes]], bin_n
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except Exception as e:
-        raise SystemExit("ERROR: matplotlib requerido para plot (pip install matplotlib).") from e
+        raise SystemExit(f"ERROR: matplotlib import failed: {type(e).__name__}: {e}") from e
 
     n = len(entries)
     if n <= 0:
-        raise SystemExit("ERROR: BIN vacío, no se puede plotear.")
+        raise SystemExit("ERROR: BIN is empty; cannot plot.")
 
     def scale_to_nits(v: float) -> float:
         v = max(0.0, min(255.0, v))
@@ -452,7 +523,7 @@ def cmd_info(args):
     nals = parse_nals_fast(data)
     au_map = compute_au_map(nals)
     if all(x == -1 for x in au_map):
-        raise SystemExit("ERROR: No AUD (NAL 35). Se requiere AUD para delimitar AUs.")
+        raise SystemExit("ERROR: No AUD (NAL 35). An AUD is required to delimit Access Units (AUs).")
 
     total = len(nals) if len(nals) else 1
     last = -1.0
@@ -471,7 +542,7 @@ def cmd_extract(args):
     nals = parse_nals_fast(data)
     au_map = compute_au_map(nals)
     if all(x == -1 for x in au_map):
-        raise SystemExit("ERROR: No AUD (NAL 35). Se requiere AUD para delimitar AUs.")
+        raise SystemExit("ERROR: No AUD (NAL 35). An AUD is required to delimit Access Units (AUs).")
 
     total_aus = max(au_map) + 1
     payload_by_au: List[Optional[bytes]] = [None] * total_aus
@@ -499,7 +570,7 @@ def cmd_remove(args):
     nals = parse_nals_fast(data)
     au_map = compute_au_map(nals)
     if all(x == -1 for x in au_map):
-        raise SystemExit("ERROR: No AUD (NAL 35). Se requiere AUD para delimitar AUs.")
+        raise SystemExit("ERROR: No AUD (NAL 35). An AUD is required to delimit Access Units (AUs).")
 
     out = bytearray()
     total = len(nals) if len(nals) else 1
@@ -546,10 +617,10 @@ def cmd_inject(args):
     print("Parsing BIN file...")
     bin_entries = read_bin_all(args.bin)
     if not bin_entries:
-        raise SystemExit("ERROR: BIN vacío o inválido.")
+        raise SystemExit("ERROR: Empty or invalid BIN file.")
     for p in bin_entries:
         if p is not None and not is_hdrvivid_t35(p):
-            raise SystemExit("ERROR: BIN contiene payload(s) no-HDRVivid (cc/pc incorrectos).")
+            raise SystemExit("ERROR: BIN contains non-HDRVivid payload(s) (incorrect cc/pc).")
 
     # BAR #1: video processing
     print("Processing input video for frame order info...")
@@ -558,7 +629,7 @@ def cmd_inject(args):
     nals = parse_nals_fast(data)
     au_map = compute_au_map(nals)
     if all(x == -1 for x in au_map):
-        raise SystemExit("ERROR: No AUD (NAL 35). Se requiere AUD para delimitar AUs.")
+        raise SystemExit("ERROR: No AUD (NAL 35). An AUD is required to delimit Access Units (AUs).")
     au_count = (max(au_map) + 1) if au_map else 0
 
     total_n = len(nals) if len(nals) else 1
