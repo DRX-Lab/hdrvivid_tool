@@ -445,11 +445,139 @@ def normalize_bin_to_au_count_cycle(bin_entries: List[Optional[bytes]], au_count
         i += 1
     return out
 
+# ----------------------------
+# Standalone plot (BIN -> PNG) - UPDATED (decodes CUVA HDR Vivid fields)
+# Rust/plotters-like design: PQ axis (0..1) with nits tick labels, two filled areas, big canvas.
+# ----------------------------
 
-# ----------------------------
-# Standalone plot (BIN -> PNG)
-# ----------------------------
-def plot_hdrvivid_style_png(path_png: str, entries: List[Optional[bytes]], bin_name: str):
+import math
+
+# ST 2084 (PQ) constants
+_PQ_M1 = 2610.0 / 16384.0
+_PQ_M2 = 2523.0 / 32.0
+_PQ_C1 = 3424.0 / 4096.0
+_PQ_C2 = 2413.0 / 128.0
+_PQ_C3 = 2392.0 / 128.0
+
+def nits_to_pq(nits: float) -> float:
+    """Absolute luminance (nits) -> PQ code value [0..1]."""
+    n = max(0.0, float(nits)) / 10000.0
+    if n <= 0.0:
+        return 0.0
+    n_m1 = n ** _PQ_M1
+    num = _PQ_C1 + _PQ_C2 * n_m1
+    den = 1.0 + _PQ_C3 * n_m1
+    return (num / den) ** _PQ_M2
+
+def pq_to_nits(pq: float) -> float:
+    """PQ code value [0..1] -> absolute luminance (nits)."""
+    v = max(0.0, min(1.0, float(pq)))
+    if v <= 0.0:
+        return 0.0
+    v_1_m2 = v ** (1.0 / _PQ_M2)
+    num = max(0.0, v_1_m2 - _PQ_C1)
+    den = _PQ_C2 - _PQ_C3 * v_1_m2
+    if den <= 0.0:
+        return 10000.0
+    n = (num / den) ** (1.0 / _PQ_M1)
+    return n * 10000.0
+
+
+def _extract_hdrvivid_fields_from_t35(payload: bytes):
+    """
+    Extract HDR Vivid CUVA fields from a T.35 payload entry (as stored in your BIN).
+
+    Expected layout (from your samples):
+      [0]        country_code = 0x26
+      [1:3]      provider_code = 0x0004
+      [3:5]      provider_oriented_code = 0x0005
+      [5]        system_start_code = 0x01
+      then bitstream:
+        min12, avg12, var12, max12 (each 12 bits)
+        tm_flag (1 bit)
+        sat_flag (1 bit)
+        remaining bits/bytes (tail), often ends with 0x00
+
+    Returns dict with decoded values or None if invalid.
+    """
+    if not payload or len(payload) < 6:
+        return None
+
+    # Validate CUVA wrapper
+    cc = payload[0]
+    pc = int.from_bytes(payload[1:3], "big")
+    poc = int.from_bytes(payload[3:5], "big")
+
+    if cc != HDRVIVID_CC or pc != HDRVIVID_PC:
+        return None
+    if poc != 0x0005:
+        return None
+
+    # Validate system_start_code
+    ssc = payload[5]
+    if ssc != 0x01:
+        return None
+
+    data = payload[6:]
+    if not data:
+        return None
+
+    class _BR:
+        __slots__ = ("b", "i", "n")
+        def __init__(self, b: bytes):
+            self.b = b
+            self.i = 0
+            self.n = len(b) * 8
+        def read(self, k: int) -> int:
+            if k < 0 or self.i + k > self.n:
+                raise EOFError
+            v = 0
+            for _ in range(k):
+                byte = self.b[self.i >> 3]
+                shift = 7 - (self.i & 7)
+                v = (v << 1) | ((byte >> shift) & 1)
+                self.i += 1
+            return v
+        def tell_bytes(self) -> int:
+            return self.i // 8
+
+    try:
+        br = _BR(data)
+        min12 = br.read(12)
+        avg12 = br.read(12)
+        var12 = br.read(12)
+        max12 = br.read(12)
+        tm_flag = br.read(1)
+        sat_flag = br.read(1)
+
+        tail_off = br.tell_bytes()
+        tail = data[tail_off:]
+    except Exception:
+        return None
+
+    return {
+        "min12": min12,
+        "avg12": avg12,
+        "var12": var12,
+        "max12": max12,
+        "tm_flag": tm_flag,
+        "sat_flag": sat_flag,
+        "tail": tail,
+        "country_code": cc,
+        "provider_code": pc,
+        "provider_oriented_code": poc,
+        "system_start_code": ssc,
+    }
+
+
+def plot_hdrvivid_style_png(path_png: str, entries, bin_name: str):
+    """
+    Rust/plotters-like design:
+      - PQ Y-axis (0..1) with key-point ticks labeled in nits
+      - Two filled area series: Maximum + Average
+      - Big canvas (3000x1200), margins, mesh, legend lower-left
+      - Captions at top-left (file, entries, missing/invalid, scale)
+    """
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -461,59 +589,108 @@ def plot_hdrvivid_style_png(path_png: str, entries: List[Optional[bytes]], bin_n
     if n <= 0:
         raise SystemExit("ERROR: BIN is empty; cannot plot.")
 
-    def scale_to_nits(v: float) -> float:
-        v = max(0.0, min(255.0, v))
-        return max(0.1, (v / 255.0) * 1000.0)
+    # Match Rust example colors
+    MAXSCL_COLOR = (65/255.0, 105/255.0, 225/255.0)  # royalblue
+    AVERAGE_COLOR = (75/255.0, 0/255.0, 130/255.0)   # indigo
 
-    max_series = []
-    avg_series = []
+    # Scale 12-bit -> nits (your mediainfo mastering ~1000 nits)
+    def u12_to_nits(u: int) -> float:
+        u = max(0, min(4095, int(u)))
+        return (u / 4095.0) * 1000.0
+
+    max_pq = []
+    avg_pq = []
+    missing = 0
+    invalid = 0
+
+    # Use a tiny floor so we never plot exactly 0 (keeps fills stable)
+    floor_pq = nits_to_pq(0.01)
+
     for p in entries:
-        if not p:
-            max_series.append(0.1)
-            avg_series.append(0.1)
+        if p is None:
+            missing += 1
+            max_pq.append(floor_pq)
+            avg_pq.append(floor_pq)
             continue
-        m = max(p)
-        a = sum(p) / len(p)
-        max_series.append(scale_to_nits(m))
-        avg_series.append(scale_to_nits(a))
 
-    maxcll = max(max_series) if max_series else 0.1
-    maxcll_avg = (sum(max_series) / len(max_series)) if max_series else 0.1
-    maxfall = max(avg_series) if avg_series else 0.1
-    maxfall_avg = (sum(avg_series) / len(avg_series)) if avg_series else 0.1
+        dec = _extract_hdrvivid_fields_from_t35(p)
+        if not dec:
+            invalid += 1
+            max_pq.append(floor_pq)
+            avg_pq.append(floor_pq)
+            continue
+
+        max_nits = u12_to_nits(dec["max12"])
+        avg_nits = u12_to_nits(dec["avg12"])
+
+        max_pq.append(nits_to_pq(max_nits))
+        avg_pq.append(nits_to_pq(avg_nits))
+
+    # Stats computed in nits (ignore floor placeholders if possible)
+    valid_max_nits = [pq_to_nits(v) for v in max_pq if v > nits_to_pq(0.02)]
+    valid_avg_nits = [pq_to_nits(v) for v in avg_pq if v > nits_to_pq(0.02)]
+
+    maxcll = max(valid_max_nits) if valid_max_nits else 0.01
+    maxcll_avg = (sum(valid_max_nits) / len(valid_max_nits)) if valid_max_nits else 0.01
+    maxfall = max(valid_avg_nits) if valid_avg_nits else 0.01
+    maxfall_avg = (sum(valid_avg_nits) / len(valid_avg_nits)) if valid_avg_nits else 0.01
 
     x = list(range(n))
-    fig = plt.figure(figsize=(19.2, 9.0), dpi=100)
+
+    # 3000x1200 like the Rust/plotters output
+    fig = plt.figure(figsize=(30.0, 12.0), dpi=100)
     ax = fig.add_subplot(111)
 
-    ax.set_title("HDR Vivid Plot", fontsize=18, pad=18)
-    ax.set_yscale("log")
-    ax.set_ylabel("nits (cd/m²)")
-    ax.set_xlabel("frames")
-    ax.grid(True, which="both", alpha=0.25)
+    ax.set_title("HDR Vivid (CUVA) Luminance Plot", fontsize=22, pad=24)
 
-    ax.plot(x, max_series, linewidth=1.0,
-            label=f"Maximum (MaxCLL: {maxcll:.2f} nits, avg: {maxcll_avg:.2f} nits)")
-    ax.fill_between(x, max_series, 0.1, alpha=0.15)
+    # PQ axis: 0..1, but label in nits
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xlabel("frames", fontsize=14)
+    ax.set_ylabel("nits (cd/m²)", fontsize=14)
 
-    ax.plot(x, avg_series, linewidth=1.0,
-            label=f"Average (MaxFALL: {maxfall:.2f} nits, avg: {maxfall_avg:.2f} nits)")
-    ax.fill_between(x, avg_series, 0.1, alpha=0.25)
+    # Mesh similar feel: bold-ish major, very light minor
+    ax.grid(True, which="major", alpha=0.10, linewidth=1.2)
+    ax.grid(True, which="minor", alpha=0.03, linewidth=0.8)
+    ax.minorticks_on()
 
-    ax.legend(loc="lower left", framealpha=0.85)
-
-    info_lines = [
-        f"{bin_name}",
-        f"Entries: {n}",
-        "Peak brightness source: payload byte max (scaled)",
+    # Same keypoints as your Rust code (nits -> PQ ticks, labels show nits)
+    key_nits = [
+        0.01, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0,
+        200.0, 400.0, 600.0, 1000.0, 2000.0, 4000.0, 10000.0
     ]
-    ax.text(0.01, 0.99, "\n".join(info_lines),
-            transform=ax.transAxes, va="top", ha="left", fontsize=10)
+    key_pq = [nits_to_pq(v) for v in key_nits]
+    ax.set_yticks(key_pq)
+    ax.set_yticklabels([("{:.3f}".format(v)).rstrip("0").rstrip(".") for v in key_nits], fontsize=11)
 
-    fig.tight_layout()
+    # Labels
+    max_label = f"Maximum (MaxCLL: {maxcll:.2f} nits, avg: {maxcll_avg:.2f} nits)"
+    avg_label = f"Average (MaxFALL: {maxfall:.2f} nits, avg: {maxfall_avg:.2f} nits)"
+
+    # Two area series (Maximum behind, Average on top)
+    ax.fill_between(x, max_pq, 0.0, alpha=0.25, linewidth=0.0, color=MAXSCL_COLOR)
+    ax.plot(x, max_pq, linewidth=1.5, color=MAXSCL_COLOR, label=max_label)
+
+    ax.fill_between(x, avg_pq, 0.0, alpha=0.50, linewidth=0.0, color=AVERAGE_COLOR)
+    ax.plot(x, avg_pq, linewidth=1.5, color=AVERAGE_COLOR, label=avg_label)
+
+    # Legend lower-left, boxed
+    leg = ax.legend(loc="lower left", framealpha=1.0, fontsize=12)
+    leg.get_frame().set_linewidth(1.0)
+
+    # Top-left captions (like plotters draw_text at (60,35) etc.)
+    caption1 = f"{bin_name}"
+    caption2 = f"Entries: {n}. Missing entries: {missing}. Invalid payloads: {invalid}."
+    caption3 = "Scale: 4095 -> 1000 nits. Peak source: CUVA max12/avg12 fields."
+
+    fig.text(0.06, 0.94, caption1, fontsize=12, ha="left", va="top")
+    fig.text(0.06, 0.92, caption2, fontsize=12, ha="left", va="top")
+    fig.text(0.06, 0.90, caption3, fontsize=12, ha="left", va="top")
+
+    # Similar margins to Rust example
+    fig.subplots_adjust(left=0.06, right=0.99, top=0.88, bottom=0.10)
+
     fig.savefig(path_png)
     plt.close(fig)
-
 
 # ----------------------------
 # Commands
@@ -799,3 +976,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
