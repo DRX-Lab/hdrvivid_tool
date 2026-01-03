@@ -104,8 +104,3 @@ python hdrvivid_tool.py plot -i metadata.bin -o plot.png
 ```
 
 ---
-
-## **Notes**
-* Plot values are **estimated** until full HDR Vivid payload decoding is implemented.
-
----
