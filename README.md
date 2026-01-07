@@ -1,4 +1,5 @@
-# **hdrvivid_tool**
+![HDR Vivid Tool Banner](https://raw.githubusercontent.com/DRX-Lab/hdrvivid_tool/main/ico/hdrvivid%20banner.png)
+# 
 
 `hdrvivid_tool` is a command-line tool for working with **HDR Vivid** metadata in **HEVC Annex-B** bitstreams.
 
@@ -102,5 +103,3 @@ Generate a PNG plot from a BIN file (**no HEVC input required**).
 ```console
 python hdrvivid_tool.py plot -i metadata.bin -o plot.png
 ```
-
----
