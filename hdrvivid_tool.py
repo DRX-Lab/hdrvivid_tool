@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-# hdrvivid_tool.py
+# hdrvivid_tool.py — STREAMING (read+write) + preserves start-code length (3/4)
 #
 # Commands:
 #   - info      (progress bar only)
-#   - extract   (progress bar only) -> single BIN (u16len+payload per AU)
-#   - remove    (progress bar only)
+#   - extract   (progress bar only) -> single BIN (u16len+payload per AU) STREAMING WRITE
+#   - remove    (progress bar only) STREAMING WRITE
 #   - inject    (prints like dovi_tool + EXACTLY TWO progress bars; no BIN bar)
+#                 Pass 1: count AUs STREAMING
+#                 Pass 2: rewrite STREAMING WRITE (output exists immediately)
 #   - plot      (standalone; BIN -> PNG; no HEVC involved; progress bar only)
 #
 # HDR Vivid target (hardcoded):
@@ -13,9 +15,22 @@
 #   country_code  = 0x26
 #   provider_code = 0x0004
 #
-# Performance:
-# - Uses fast start-code scanning via bytes.find (no per-byte loops for AnnexB)
-# - Uses large read/write chunks (default 16 MiB)
+# Design goals:
+# - True streaming for HEVC operations (no full-file buffering)
+# - Constant memory usage for remove/extract/inject
+# - Output is written as input is read
+# - Preserves original Annex-B start-code length (3 or 4 bytes) per NAL
+# - Access Unit (AU) boundaries:
+#     Primary: AUD (nal_type 35)
+#     Fallback: VCL slice header first_slice_segment_in_pic_flag (best-effort)
+#
+# Notes:
+# - The fallback AU detection is "best effort" and may not be perfect on malformed streams.
+# - If neither AUD nor decodable VCL slice headers exist, operations that require AU mapping will error.
+#
+# Inject behavior (length mismatch):
+# - If BIN entries < video AUs: metadata is duplicated at the end to match video length.
+# - If BIN entries > video AUs: metadata is skipped at the end to match video length.
 
 import sys
 import os
@@ -31,7 +46,9 @@ HDRVIVID_SEI_PT = 4
 HDRVIVID_CC = 0x26
 HDRVIVID_PC = 0x0004
 
-DEFAULT_IO_CHUNK = 16 * 1024 * 1024  # 16 MiB
+DEFAULT_IO_CHUNK = 64 * 1024 * 1024  # 64 MiB
+DEFAULT_AUD_SCAN_LIMIT = 256 * 1024 * 1024  # 256 MiB
+PROGRESS_STEP_PCT = 0.5
 
 _START3 = b"\x00\x00\x01"
 
@@ -203,50 +220,23 @@ def rbsp_trailing_bits() -> bytes:
 
 
 # ------------------------------------------------------------
-# Minimal bitreader for AU fallback (slice header inspection)
+# FAST AU fallback (slice header inspection)
 # ------------------------------------------------------------
-
-class _BitReader:
-    __slots__ = ("_b", "_i", "_n")
-    def __init__(self, data: bytes):
-        self._b = data
-        self._i = 0
-        self._n = len(data) * 8
-
-    def read_bits(self, k: int) -> int:
-        if k <= 0:
-            return 0
-        if self._i + k > self._n:
-            raise EOFError("bitreader overflow")
-        v = 0
-        for _ in range(k):
-            byte = self._b[self._i >> 3]
-            shift = 7 - (self._i & 7)
-            v = (v << 1) | ((byte >> shift) & 1)
-            self._i += 1
-        return v
 
 def hevc_first_slice_segment_in_pic_flag(nal_wo_sc: bytes) -> Optional[bool]:
     """
-    Best-effort:
+    FAST best-effort:
       For VCL NALs in HEVC, slice_segment_layer_rbsp begins with:
         first_slice_segment_in_pic_flag (1 bit)
-    We remove EPB from nal[2:] (skipping 2-byte NAL header) and read the first bit.
-    Returns True/False for decodable VCL NALs; None otherwise.
+    We can read this bit directly from nal_wo_sc[2] (after 2-byte NAL header),
+    without EPB removal or a full bitreader.
     """
     if len(nal_wo_sc) < 3:
         return None
     t = nal_type_hevc(nal_wo_sc)
     if not is_vcl(t):
         return None
-    rbsp = remove_emulation_prevention(nal_wo_sc[2:])
-    if not rbsp:
-        return None
-    try:
-        br = _BitReader(rbsp)
-        return bool(br.read_bits(1))
-    except Exception:
-        return None
+    return bool(nal_wo_sc[2] & 0x80)
 
 
 # ------------------------------------------------------------
@@ -264,7 +254,6 @@ def parse_sei_messages(rbsp: bytes) -> List[SeiMessage]:
     i = 0
     n = len(rbsp)
     while i < n:
-        # trailing bits
         if i == n - 1 and rbsp[i] == 0x80:
             break
 
@@ -358,6 +347,11 @@ def read_bin_all(path: str) -> List[Optional[bytes]]:
     return out
 
 def normalize_bin_to_au_count_cycle(entries: List[Optional[bytes]], au_count: int) -> List[Optional[bytes]]:
+    """
+    Match BIN entries to AU count:
+      - If entries >= au_count: trim (skip at end)
+      - If entries < au_count: duplicate/cycle until au_count
+    """
     if au_count <= 0:
         return []
     if not entries:
@@ -384,26 +378,18 @@ class AuTracker:
     saw_vcl: bool = False
 
     def feed(self, nal_wo_sc: bytes) -> Tuple[int, bool]:
-        """
-        Feed one NAL, return (current_au_index, boundary_started_now).
-        - If boundary_started_now is True, a new AU began at this NAL.
-        - If AU cannot be determined yet (no VCL and no AUD), returns au=-1.
-        """
         t = nal_type_hevc(nal_wo_sc)
 
-        # Primary mode: AUD
         if self.use_aud:
             if t == 35:  # AUD
                 self.au += 1
                 return self.au, True
             return self.au, False
 
-        # Fallback mode: VCL first_slice flag
         if is_vcl(t):
             self.saw_vcl = True
             fs = hevc_first_slice_segment_in_pic_flag(nal_wo_sc)
             if self.au == -1:
-                # First VCL anchors AU 0, even if fs is undecodable
                 self.au = 0
                 return self.au, True
             if fs is True:
@@ -411,17 +397,17 @@ class AuTracker:
                 return self.au, True
             return self.au, False
 
-        # Non-VCL NALs belong to current AU; if no AU yet, keep -1
         return self.au, False
 
 
-def detect_aud_presence(path: str, chunk: int) -> bool:
-    """Quick streaming scan to see if any AUD exists."""
+def detect_aud_presence(path: str, chunk: int, scan_limit_bytes: int = DEFAULT_AUD_SCAN_LIMIT) -> bool:
     with open(path, "rb") as base:
         fin = CountingReader(base)
         for _, nal in iter_annexb_nals_stream(fin, chunk):
             if nal_type_hevc(nal) == 35:
                 return True
+            if scan_limit_bytes > 0 and fin.bytes_read >= scan_limit_bytes:
+                break
     return False
 
 
@@ -439,8 +425,8 @@ def cmd_info(args):
     with open(args.input, "rb") as base:
         fin = CountingReader(base)
 
-        for sc_len, nal in iter_annexb_nals_stream(fin, args.io_chunk):
-            _au, _ = tracker.feed(nal)
+        for _sc_len, nal in iter_annexb_nals_stream(fin, args.io_chunk):
+            tracker.feed(nal)
 
             t = nal_type_hevc(nal)
             if t in (39, 40) and len(nal) >= 2:
@@ -448,13 +434,12 @@ def cmd_info(args):
                 _ = parse_sei_messages(rbsp)
 
             pct = (fin.bytes_read * 100.0 / total) if total > 0 else 100.0
-            if pct - last >= 0.1 or pct >= 100.0:
+            if pct - last >= PROGRESS_STEP_PCT or pct >= 100.0:
                 progress_bar(pct)
                 last = pct
 
     progress_done()
 
-    # Validate we could determine AUs at least once for AU-dependent ops
     if not has_aud and not tracker.saw_vcl:
         raise SystemExit("ERROR: No AUD and no VCL NAL units detected; cannot infer Access Units.")
 
@@ -491,10 +476,9 @@ def cmd_remove(args):
                 ]
                 if kept:
                     fout.write(build_sei_prefix_nal(sc_len, kept))
-                # else drop SEI
 
             pct = (fin.bytes_read * 100.0 / total) if total > 0 else 100.0
-            if pct - last >= 0.1 or pct >= 100.0:
+            if pct - last >= PROGRESS_STEP_PCT or pct >= 100.0:
                 progress_bar(pct)
                 last = pct
 
@@ -533,10 +517,9 @@ def cmd_extract(args):
         stored_payload: Optional[bytes] = None
         ever_started_au = False
 
-        for sc_len, nal in iter_annexb_nals_stream(fin, args.io_chunk):
+        for _sc_len, nal in iter_annexb_nals_stream(fin, args.io_chunk):
             au, started = tracker.feed(nal)
 
-            # On AU boundary: flush previous AU entry (if any)
             if started:
                 ever_started_au = True
                 if current_au >= 0:
@@ -556,11 +539,10 @@ def cmd_extract(args):
                         break
 
             pct = (fin.bytes_read * 100.0 / total) if total > 0 else 100.0
-            if pct - last >= 0.1 or pct >= 100.0:
+            if pct - last >= PROGRESS_STEP_PCT or pct >= 100.0:
                 progress_bar(pct)
                 last = pct
 
-        # Flush last AU
         if current_au >= 0:
             write_bin_entry(bout, stored_payload if wrote_for_current else None)
 
@@ -576,12 +558,7 @@ def cmd_extract(args):
 # INJECT (two-pass streaming)
 # ------------------------------------------------------------
 
-def count_aus_streaming(path: str, chunk: int) -> int:
-    """
-    Counts AUs in a streaming pass:
-      - If any AUD exists => count AUD NALs (each AUD starts an AU)
-      - Else => infer AUs using VCL first_slice_segment_in_pic_flag
-    """
+def count_aus_streaming(path: str, chunk: int) -> Tuple[int, bool, bool]:
     total = os.path.getsize(path)
     last = -1.0
 
@@ -595,11 +572,10 @@ def count_aus_streaming(path: str, chunk: int) -> int:
         for _, nal in iter_annexb_nals_stream(fin, chunk):
             au, started = tracker.feed(nal)
             if started and au >= 0:
-                # AU indices start at 0; count by increments
                 au_count = max(au_count, au + 1)
 
             pct = (fin.bytes_read * 100.0 / total) if total > 0 else 100.0
-            if pct - last >= 0.1 or pct >= 100.0:
+            if pct - last >= PROGRESS_STEP_PCT or pct >= 100.0:
                 progress_bar(pct)
                 last = pct
 
@@ -609,11 +585,11 @@ def count_aus_streaming(path: str, chunk: int) -> int:
         raise SystemExit("ERROR: No AUD and no VCL NAL units detected; cannot infer Access Units.")
     if au_count <= 0:
         raise SystemExit("ERROR: AU count is zero; cannot proceed.")
-    return au_count
+    return au_count, has_aud, tracker.saw_vcl
 
 
 def cmd_inject(args):
-    # NO bar for BIN parsing
+    # No progress bar for BIN parsing
     print("Parsing BIN file...")
     bin_entries = read_bin_all(args.bin)
     if not bin_entries:
@@ -622,29 +598,26 @@ def cmd_inject(args):
         if p is not None and not is_hdrvivid_t35(p):
             raise SystemExit("ERROR: BIN contains non-HDRVivid payload(s) (incorrect cc/pc).")
 
-    # BAR #1: count AUs
+    # Progress bar #1: count AUs
     print("Processing input video for frame order info...")
-    au_count = count_aus_streaming(args.input, args.io_chunk)
-    if au_count <= 0:
-        raise SystemExit("ERROR: Could not count Access Units.")
+    au_count, has_aud, _saw_vcl = count_aus_streaming(args.input, args.io_chunk)
 
+    # Match BIN length to video AU count (duplicate or trim), with dovi_tool-like stdout messages
     if len(bin_entries) != au_count:
-        sys.stderr.write(f"\nWarning: mismatched lengths. video {au_count}, BIN {len(bin_entries)}\n")
+        print(f"\nWarning: mismatched lengths. video {au_count}, BIN {len(bin_entries)}")
         if len(bin_entries) < au_count:
-            sys.stderr.write("Metadata will be duplicated at the end to match video length\n")
+            print("Metadata will be duplicated at the end to match video length\n")
         else:
-            sys.stderr.write("Metadata will be skipped at the end to match video length\n")
-        sys.stderr.flush()
+            print("Metadata will be skipped at the end to match video length\n")
 
     payloads_by_au = normalize_bin_to_au_count_cycle(bin_entries, au_count)
 
-    # BAR #2: rewrite/inject STREAMING
+    # Progress bar #2: rewrite/inject (reuse has_aud; no extra AUD scan)
     print("Rewriting file with interleaved HDR Vivid SEI NALs..")
 
     total = os.path.getsize(args.input)
     last = -1.0
 
-    has_aud = detect_aud_presence(args.input, args.io_chunk)
     tracker = AuTracker(use_aud=has_aud)
 
     def au_payload(au: int) -> Optional[bytes]:
@@ -659,15 +632,14 @@ def cmd_inject(args):
         fin = CountingReader(base)
 
         current_au = -1
-        inserted = False       # ensured an HDRVivid for this AU
-        inserted_by_us = False # we inserted a new SEI before first VCL
+        inserted = False        # ensured an HDRVivid for this AU
+        inserted_by_us = False  # we inserted a new SEI before first VCL
 
         for sc_len, nal in iter_annexb_nals_stream(fin, args.io_chunk):
             au, started = tracker.feed(nal)
             t = nal_type_hevc(nal)
             start_code = b"\x00\x00\x01" if sc_len == 3 else b"\x00\x00\x00\x01"
 
-            # On AU boundary, reset per-AU state
             if started:
                 current_au = au
                 inserted = False
@@ -695,11 +667,11 @@ def cmd_inject(args):
                     fout.write(start_code + nal)
                 else:
                     if pld is None:
-                        # BIN says "no insert": preserve original
+                        # No metadata to inject: preserve original SEI as-is
                         fout.write(start_code + nal)
                     else:
                         if inserted_by_us:
-                            # we already inserted earlier, remove HDRVivid here to avoid duplicates
+                            # Already inserted earlier; remove HDRVivid here to avoid duplicates
                             kept = [
                                 SeiMessage(m.payload_type, m.payload, m.truncated)
                                 for m in msgs
@@ -707,9 +679,8 @@ def cmd_inject(args):
                             ]
                             if kept:
                                 fout.write(build_sei_prefix_nal(sc_len, kept))
-                            # else drop
                         else:
-                            # replace first HDRVivid message
+                            # Replace first HDRVivid message
                             new_msgs: List[SeiMessage] = []
                             replaced = False
                             for m in msgs:
@@ -723,7 +694,7 @@ def cmd_inject(args):
                             inserted_by_us = False
 
                 pct = (fin.bytes_read * 100.0 / total) if total > 0 else 100.0
-                if pct - last >= 0.1 or pct >= 100.0:
+                if pct - last >= PROGRESS_STEP_PCT or pct >= 100.0:
                     progress_bar(pct)
                     last = pct
                 continue
@@ -732,7 +703,7 @@ def cmd_inject(args):
             fout.write(start_code + nal)
 
             pct = (fin.bytes_read * 100.0 / total) if total > 0 else 100.0
-            if pct - last >= 0.1 or pct >= 100.0:
+            if pct - last >= PROGRESS_STEP_PCT or pct >= 100.0:
                 progress_bar(pct)
                 last = pct
 
@@ -743,7 +714,7 @@ def cmd_inject(args):
 
 
 # ------------------------------------------------------------
-# PLOT (BIN-only) — unchanged from your prior version
+# PLOT (BIN-only) — unchanged from your provided version
 # ------------------------------------------------------------
 import math
 
@@ -754,7 +725,6 @@ _PQ_C2 = 2413.0 / 128.0
 _PQ_C3 = 2392.0 / 128.0
 
 def nits_to_pq(nits: float) -> float:
-    """Absolute luminance (nits) -> PQ code value [0..1]."""
     n = max(0.0, float(nits)) / 10000.0
     if n <= 0.0:
         return 0.0
@@ -764,7 +734,6 @@ def nits_to_pq(nits: float) -> float:
     return (num / den) ** _PQ_M2
 
 def pq_to_nits(pq: float) -> float:
-    """PQ code value [0..1] -> absolute luminance (nits)."""
     v = max(0.0, min(1.0, float(pq)))
     if v <= 0.0:
         return 0.0
@@ -776,16 +745,20 @@ def pq_to_nits(pq: float) -> float:
     n = (num / den) ** (1.0 / _PQ_M1)
     return n * 10000.0
 
+def count_hdrvivid_scenes(entries):
+    scenes = 0
+    prev = None
+    for p in entries:
+        if p is None:
+            continue
+        if _extract_hdrvivid_fields_from_t35(p) is None:
+            continue
+        if prev is None or p != prev:
+            scenes += 1
+            prev = p
+    return scenes
+
 def _extract_hdrvivid_fields_from_t35(payload: bytes):
-    """
-    Extract HDR Vivid CUVA fields from a T.35 payload entry (as stored in your BIN).
-    Expected CUVA wrapper:
-      [0]   country_code = 0x26
-      [1:3] provider_code = 0x0004
-      [3:5] provider_oriented_code = 0x0005
-      [5]   system_start_code = 0x01
-    Then bitstream: min12, avg12, var12, max12 (12 bits each), tm_flag (1), sat_flag (1)
-    """
     if not payload or len(payload) < 6:
         return None
     cc = payload[0]
@@ -834,8 +807,10 @@ def _extract_hdrvivid_fields_from_t35(payload: bytes):
     except Exception:
         return None
 
-    return {"min12": min12, "avg12": avg12, "var12": var12, "max12": max12,
-            "tm_flag": tm_flag, "sat_flag": sat_flag, "tail": tail}
+    return {
+        "min12": min12, "avg12": avg12, "var12": var12, "max12": max12,
+        "tm_flag": tm_flag, "sat_flag": sat_flag, "tail": tail
+    }
 
 def plot_hdrvivid_style_png(path_png: str, entries, bin_name: str):
     try:
@@ -851,44 +826,54 @@ def plot_hdrvivid_style_png(path_png: str, entries, bin_name: str):
 
     MAXSCL_COLOR = (65 / 255.0, 105 / 255.0, 225 / 255.0)
     AVERAGE_COLOR = (75 / 255.0, 0 / 255.0, 130 / 255.0)
-    MINIMUM_COLOR = (0.10, 0.10, 0.10)
 
     def u12_to_nits(u: int) -> float:
         u = max(0, min(4095, int(u)))
         return (u / 4095.0) * 1000.0
 
     max_pq, avg_pq, min_pq = [], [], []
-    missing = 0
-    invalid = 0
     floor_pq = nits_to_pq(0.01)
 
     for p in entries:
         if p is None:
-            missing += 1
             max_pq.append(floor_pq); avg_pq.append(floor_pq); min_pq.append(floor_pq)
             continue
         dec = _extract_hdrvivid_fields_from_t35(p)
         if not dec:
-            invalid += 1
             max_pq.append(floor_pq); avg_pq.append(floor_pq); min_pq.append(floor_pq)
             continue
         max_pq.append(nits_to_pq(u12_to_nits(dec["max12"])))
         avg_pq.append(nits_to_pq(u12_to_nits(dec["avg12"])))
         min_pq.append(nits_to_pq(u12_to_nits(dec["min12"])))
 
+    first_valid = 0
+    last_valid = n - 1
+    while first_valid < n and max_pq[first_valid] <= floor_pq:
+        first_valid += 1
+    while last_valid >= 0 and max_pq[last_valid] <= floor_pq:
+        last_valid -= 1
+    if first_valid >= last_valid:
+        raise SystemExit("ERROR: No valid HDR Vivid entries to plot (all missing/invalid).")
+
+    max_pq = max_pq[first_valid:last_valid + 1]
+    avg_pq = avg_pq[first_valid:last_valid + 1]
+    min_pq = min_pq[first_valid:last_valid + 1]
+
+    trimmed_entries = entries[first_valid:last_valid + 1]
+    scenes_count = count_hdrvivid_scenes(trimmed_entries)
+
     valid_max_nits = [pq_to_nits(v) for v in max_pq if v > nits_to_pq(0.02)]
     valid_avg_nits = [pq_to_nits(v) for v in avg_pq if v > nits_to_pq(0.02)]
-    valid_min_nits = [pq_to_nits(v) for v in min_pq if v > nits_to_pq(0.02)]
 
     maxcll = max(valid_max_nits) if valid_max_nits else 0.01
     maxcll_avg = (sum(valid_max_nits) / len(valid_max_nits)) if valid_max_nits else 0.01
     maxfall = max(valid_avg_nits) if valid_avg_nits else 0.01
     maxfall_avg = (sum(valid_avg_nits) / len(valid_avg_nits)) if valid_avg_nits else 0.01
-    minval = min(valid_min_nits) if valid_min_nits else 0.01
 
     thresholds = [100, 150, 200, 400, 600, 1000, 2000, 4000]
     def pct_above(series, thr):
-        if not series: return 0.0
+        if not series:
+            return 0.0
         c = sum(1 for x in series if x > thr)
         return (c / len(series)) * 100.0
 
@@ -902,16 +887,19 @@ def plot_hdrvivid_style_png(path_png: str, entries, bin_name: str):
         lines.append(f"MaxCLL Percentage Above {t}nits: {pct_above(valid_max_nits, t):.2f}")
     stats_block = "\n".join(lines)
 
-    x = list(range(n))
+    x = list(range(len(max_pq)))
+
     fig = plt.figure(figsize=(30.0, 12.0), dpi=100)
     ax = fig.add_subplot(111)
-    ax.set_title("HDR Vivid (CUVA) Luminance Plot", fontsize=22, pad=24)
+    ax.set_title("HDRVivid (CUVA) Plot", fontsize=22, pad=24)
     ax.set_ylim(0.0, 1.0)
     ax.set_xlabel("frames", fontsize=14)
     ax.set_ylabel("nits (cd/m²)", fontsize=14)
     ax.grid(True, which="major", alpha=0.10, linewidth=1.2)
     ax.grid(True, which="minor", alpha=0.03, linewidth=0.8)
     ax.minorticks_on()
+    ax.set_xlim(0, len(x) - 1)
+    ax.margins(x=0)
 
     key_nits = [0.01, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0,
                 200.0, 400.0, 600.0, 1000.0, 2000.0, 4000.0, 10000.0]
@@ -921,26 +909,24 @@ def plot_hdrvivid_style_png(path_png: str, entries, bin_name: str):
 
     max_label = f"Maximum (MaxCLL: {maxcll:.2f} nits, avg: {maxcll_avg:.2f} nits)"
     avg_label = f"Average (MaxFALL: {maxfall:.2f} nits, avg: {maxfall_avg:.2f} nits)"
-    min_label = f"Minimum (min: {minval:.3f} nits)" if minval < 1.0 else f"Minimum (min: {minval:.2f} nits)"
 
     ax.fill_between(x, max_pq, 0.0, alpha=0.25, linewidth=0.0, color=MAXSCL_COLOR)
     ax.plot(x, max_pq, linewidth=1.5, color=MAXSCL_COLOR, label=max_label)
-
     ax.fill_between(x, avg_pq, 0.0, alpha=0.50, linewidth=0.0, color=AVERAGE_COLOR)
     ax.plot(x, avg_pq, linewidth=1.5, color=AVERAGE_COLOR, label=avg_label)
-
-    ax.plot(x, min_pq, linewidth=1.0, color=MINIMUM_COLOR, alpha=0.75, label=min_label)
 
     leg = ax.legend(loc="lower left", framealpha=1.0, fontsize=12)
     leg.get_frame().set_linewidth(1.0)
 
-    caption1 = f"{bin_name}"
-    caption2 = f"Entries: {n}. Missing entries: {missing}. Invalid payloads: {invalid}."
-    caption3 = "Scale: 4095 -> 1000 nits. Source: CUVA max12/avg12 fields."
+    caption1 = f"{bin_name}".replace(".bin", "")
+    caption2 = f"Frames: {len(trimmed_entries)}. Scenes: {scenes_count}."
+    caption3 = "Peak brightness source: CUVA max12"
+
     fig.text(0.06, 0.94, caption1, fontsize=12, ha="left", va="top")
     fig.text(0.06, 0.92, caption2, fontsize=12, ha="left", va="top")
     fig.text(0.06, 0.90, caption3, fontsize=12, ha="left", va="top")
     fig.text(0.99, 0.94, stats_block, fontsize=10, ha="right", va="top")
+
     fig.subplots_adjust(left=0.06, right=0.99, top=0.88, bottom=0.10)
     fig.savefig(path_png)
     plt.close(fig)
